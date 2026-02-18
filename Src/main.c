@@ -49,9 +49,11 @@ DMA_HandleTypeDef hdma_usart2_rx;
 /* USER CODE BEGIN PV */
 
 #define RX_DMA_SZ 512
+
+// TODO: H7 Chip has a cache region, make sure this areaa not in cache. (DMA goes to RAM, CPU reads from cache, potentially reading stale bytes)
 static uint8_t rx_dma_buf[RX_DMA_SZ];
 static volatile uint16_t rx_rd = 0;		// Software read index
-volatile uint8_t rx_kick = 0;	// IDLE interrupt fires and sets this to 1, so we know to start looking at the ring
+
 
 static Parser parser;
 static Frame frame;
@@ -121,9 +123,12 @@ int main(void)
   parser_init(&parser);
   rx_rd = 0;
 
-  HAL_UART_Receive_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
 
-  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+  __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+
+//  HAL_UART_Receive_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
+//  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
 
   /* USER CODE END 2 */
 
@@ -134,35 +139,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (rx_kick) {
-		  rx_kick = 0;
 
-		  uint16_t wr = (uint16_t)(RX_DMA_SZ - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
-
-		  // Catch up to bits written
-		  while (rx_rd != wr) {
-			  uint8_t b = rx_dma_buf[rx_rd];
-			  rx_rd++;
-			  if (rx_rd == RX_DMA_SZ) {	// Reached the end of ring
-				  rx_rd = 0;
-			  }
-
-			  if (parser_feed(&parser, b, &frame)) {
-				  led_toggle_fast();
-				  // Handle copmlete frame
-				  switch ((msg_type_t) frame.msg) {
-					  case MSG_PING: {
-						  uint8_t status= ACK_PING;
-						  size_t n = frame_build(txbuf, frame.ver, MSG_ACK, frame.seq, 0, &status, 1);
-						  HAL_UART_Transmit(&huart2, txbuf, n, 100);
-						  break;
-					  }
-					  default:
-						  break;
-				  }
-			  }
-		  }
-	  }
   }
 
   /* USER CODE END 3 */
@@ -310,6 +287,39 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+	if (huart->Instance != USART2) {
+		return;
+	}
+
+	// Size is how many bytes are in the DMA buffer from the star
+	// Drain from rx_rd up to Size in one direction
+
+	uint16_t wr = Size;
+
+	while (rx_rd != wr) {
+		uint8_t b = rx_dma_buf[rx_rd];
+		rx_rd++;
+		if (rx_rd == RX_DMA_SZ) {
+			rx_rd = 0;
+		}
+
+		if (parser_feed(&parser, b, &frame)) {
+			if (frame.msg == MSG_PING) {
+				uint8_t status = ACK_PING;
+				size_t n = frame_build(txbuf, frame.ver, MSG_ACK, frame.seq, 0, &status, 1);
+				HAL_UART_Transmit(&huart2, txbuf, n, 100);
+			}
+			else if (frame.msg == MSG_CMD) {
+				// TODO
+			}
+			else if (frame.msg == MSG_CFG) {
+				// TODO
+			}
+		}
+	}
+}
 
 /* USER CODE END 4 */
 
