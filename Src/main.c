@@ -18,12 +18,19 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "uart_frame.h"
 #include "protocol.h"
 #include "uart_rx.h"
+
+// Use Native FreeRTOS implementation rather than the CMSIS implementation
+// #include "FreeRTOS.h"
+// #include "queue.h"
+
+#include "uart_link.h"
 
 /* USER CODE END Includes */
 
@@ -46,19 +53,22 @@
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
 
-#define RX_DMA_SZ 512
-
 // TODO: H7 Chip has a cache region, make sure this areaa not in cache. (DMA goes to RAM, CPU reads from cache, potentially reading stale bytes)
+// FreeRTOS Implementation
+
+#define RX_DMA_SZ 512
 static uint8_t rx_dma_buf[RX_DMA_SZ];
-static volatile uint16_t rx_rd = 0;		// Software read index
 
-
-static Parser parser;
-static Frame frame;
-static uint8_t txbuf[128];
-
+uart_link_t uart2_link;
 
 /* USER CODE END PV */
 
@@ -67,7 +77,11 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
+void StartDefaultTask(void *argument);
+
 /* USER CODE BEGIN PFP */
+
+void cmd_task(void *arg);
 
 
 /* USER CODE END PFP */
@@ -84,6 +98,12 @@ static void toggle_led() {
 static inline void led_toggle_fast(void) {
   HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_7);
 }
+
+static void mark(int n){
+  for(int i=0;i<n;i++){ HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_7); HAL_Delay(80); }
+  HAL_Delay(400);
+}
+
 
 /* USER CODE END 0 */
 
@@ -120,17 +140,67 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  parser_init(&parser);
-  rx_rd = 0;
-
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
-
-  __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
-
 //  HAL_UART_Receive_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
 //  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  // should create threads after osKernelInitialize
+
+  // the heap didn't have enough memory
+//   BaseType_t r1 = xTaskCreate(uart_rx_task, "uart_rx", 256, NULL, tskIDLE_PRIORITY+3, &uartRxTaskHandle);
+//   BaseType_t r2 = xTaskCreate(uart_tx_task, "uart_tx", 256, NULL, tskIDLE_PRIORITY+2, NULL);
+   BaseType_t r3 = xTaskCreate(cmd_task, "cmd", 256, NULL, tskIDLE_PRIORITY+1, NULL);
+
+  uart_link_init(&uart2_link, &huart2, &rx_dma_buf, RX_DMA_SZ, tskIDLE_PRIORITY+3, 256, tskIDLE_PRIORITY+2, 256, 8);
+
+  if (uart2_link.rx_task == NULL) {
+	  led_toggle_fast();
+	  return;
+  }
+  // Attaching dma to DMA buffer, and registering IDLE interrupt
+//   HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buf, RX_DMA_SZ);
+  if (!uart_link_start(&uart2_link, true)) {
+    led_toggle_fast();
+    return;
+  }
+
+
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -249,7 +319,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 
 }
@@ -289,39 +359,100 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
-	if (huart->Instance != USART2) {
-		return;
-	}
+	uart_link_rx_event_isr(&uart2_link, huart, Size);
+}
 
-	// Size is how many bytes are in the DMA buffer from the star
-	// Drain from rx_rd up to Size in one direction
 
-	uint16_t wr = Size;
+// ----------------------------------
+// Custom Definition'd FREERTOS Tasks
+// ----------------------------------
+// Finding current write index
+// static inline uint16_t dma_wr_idx(void) {
+// 	return (uint16_t) (RX_DMA_SZ - __HAL_DMA_GET_COUNTER(huart2.hdmarx));
+// }
 
-	while (rx_rd != wr) {
-		uint8_t b = rx_dma_buf[rx_rd];
-		rx_rd++;
-		if (rx_rd == RX_DMA_SZ) {
-			rx_rd = 0;
-		}
+// void uart_rx_task(void *arg) {
+// 	Frame f;
 
-		if (parser_feed(&parser, b, &frame)) {
-			if (frame.msg == MSG_PING) {
-				uint8_t status = ACK_PING;
-				size_t n = frame_build(txbuf, frame.ver, MSG_ACK, frame.seq, 0, &status, 1);
-				HAL_UART_Transmit(&huart2, txbuf, n, 100);
+// 	while (1) {
+// 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+// 		uint16_t wr = dma_wr_idx();
+
+// 		// Consume until the write index
+// 		while (rx_rd != wr) {
+// 			uint8_t b = rx_dma_buf[rx_rd];
+// 			rx_rd = (rx_rd + 1) & (RX_DMA_SZ - 1);
+
+// 			if (parser_feed(&parser, b, &f)) {
+// 				xQueueSend(frame_q, &f, 0);
+// 				// This will drop if the queue is full.
+// 			}
+// 		}
+// 	}
+// }
+
+
+// cmd_task
+// To process receive queue and decide what to send
+void cmd_task(void *arg)
+{
+	Frame f;
+	while (1) {
+		if (xQueueReceive(uart2_link.frame_q, &f, portMAX_DELAY) == pdTRUE) {
+			if (f.msg == MSG_PING)
+			{
+				Frame ack = {
+						.ver = f.ver,
+						.msg = MSG_ACK,
+						.len = 1,
+						.seq = f.seq,
+						.flags = 0
+				};
+				ack.payload[0] = ACK_PING;
+				xQueueSend(uart2_link.tx_q, &ack, 0);
 			}
-			else if (frame.msg == MSG_CMD) {
-				// TODO
-			}
-			else if (frame.msg == MSG_CFG) {
-				// TODO
-			}
+			// TODO: define other handling methods
 		}
 	}
 }
 
+// uart_tx_task
+// To dispatch items that we want to send
+// void uart_tx_task(void *arg)
+// {
+// 	Frame f;
+// 	uint8_t out[128];
+
+// 	for (;;) {
+// 		if (xQueueReceive(tx_q, &f, portMAX_DELAY) == pdTRUE)
+// 		{
+// 			size_t n = frame_build(out, f.ver, f.msg, f.seq, f.flags, f.payload, f.len);
+// 			HAL_UART_Transmit(&huart2, out, (uint16_t) n, 100);
+// 		}
+// 	}
+// }
+
+
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

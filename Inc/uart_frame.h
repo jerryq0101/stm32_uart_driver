@@ -23,7 +23,6 @@ typedef struct {
 	uint16_t crc;						// CRC
 } Frame;
 
-
 // Frame Parsing state
 // Need two states for SOF as first waiting for it
 typedef enum {
