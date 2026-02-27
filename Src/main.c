@@ -24,7 +24,6 @@
 /* USER CODE BEGIN Includes */
 #include "uart_frame.h"
 #include "protocol.h"
-#include "uart_rx.h"
 
 // Use Native FreeRTOS implementation rather than the CMSIS implementation
 // #include "FreeRTOS.h"
